@@ -10,13 +10,58 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
     auth: { persistSession: false, autoRefreshToken: false },
 });
 
+// Helper function to validate OpenClaw VPS instance URLs
+function isOpenClawInstance(origin) {
+    if (!origin) return false;
+    
+    // Pattern for OpenClaw VPS instances: https://openclaw-user-{unique-id}.h1.openclaw.magicteams.ai
+    // Also supports ws:// for WebSocket connections and any subdomain patterns
+    const openClawPatterns = [
+        /^https:\/\/openclaw-user-[a-zA-Z0-9]+\.h1\.openclaw\.magicteams\.ai$/,  // HTTPS instances
+        /^wss:\/\/openclaw-user-[a-zA-Z0-9]+\.h1\.openclaw\.magicteams\.ai$/,   // WebSocket Secure
+        /^ws:\/\/openclaw-user-[a-zA-Z0-9]+\.h1\.openclaw\.magicteams\.ai$/,    // WebSocket
+        /^https:\/\/[a-zA-Z0-9-]+\.openclaw\.magicteams\.ai$/,                  // Any subdomain pattern
+        /^wss:\/\/[a-zA-Z0-9-]+\.openclaw\.magicteams\.ai$/,                    // WSS any subdomain
+        /^ws:\/\/[a-zA-Z0-9-]+\.openclaw\.magicteams\.ai$/                      // WS any subdomain
+    ];
+    
+    return openClawPatterns.some(pattern => pattern.test(origin));
+}
+
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGIN || 'http://localhost:5173');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Internal-Secret');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    // Define allowed origins for CORS
+    const allowedOrigins = [
+        'http://localhost:5173',        // Local development
+        'https://localhost:5173',       // Local development with HTTPS
+        'https://magicteams.ai',        // Production domain
+        'https://www.magicteams.ai',    // Production domain with www
+        'https://mission-control-frontend-kappa.vercel.app',
+        'https://mission-control-control-plane.vercel.app/',
+        process.env.ALLOWED_ORIGIN      // Additional origin from env
+    ].filter(Boolean); // Remove undefined values
+
+    const origin = req.headers.origin;
+    
+    // Check for exact matches first
+    if (allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    // Check for OpenClaw VPS instance patterns
+    else if (origin && isOpenClawInstance(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+    else if (!origin) {
+        // Allow requests with no origin (like mobile apps or curl)
+        res.setHeader('Access-Control-Allow-Origin', allowedOrigins[0]);
+    }
+    
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Internal-Secret, stripe-signature');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, PUT, PATCH, OPTIONS');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
