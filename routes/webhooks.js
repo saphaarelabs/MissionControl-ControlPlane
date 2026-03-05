@@ -49,7 +49,7 @@ router.post('/node-register', requireInternalSecret, async (req, res) => {
                     host_shard: shard,
                     base_domain: baseDomain,
                     ttyd_secret: ttydSecret,
-                    capacity_max: parseInt(process.env.VPS_CAPACITY_MAX || '6'),
+                    capacity_max: parseInt(process.env.VPS_CAPACITY_MAX || '5'),
                     capacity_used: 0,
                     status: 'ready',
                 })
