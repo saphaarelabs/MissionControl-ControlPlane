@@ -91,11 +91,11 @@ app.get('/healthz', (_, res) => res.json({ ok: true }));
 app.use('/api/webhooks', webhookRoutes);
 
 app.post('/api/provision/user', requireInternal, async (req, res) => {
-    const { userId, username } = req.body;
+    const { userId, username, onboardingData } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId required' });
-    console.log(`[control-plane] provisioning user ${userId} (${username || userId})`);
+    console.log(`[control-plane] provisioning user ${userId} (${username || userId}) with onboarding data: ${!!onboardingData}`);
     try {
-        const result = await provisionUser(userId, username || userId);
+        const result = await provisionUser(userId, username || userId, onboardingData);
         console.log(`[control-plane] provisioning done for ${userId}:`, result);
         return res.json(result);
     } catch (err) {
