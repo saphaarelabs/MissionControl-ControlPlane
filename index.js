@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import webhookRoutes from './routes/webhooks.js';
