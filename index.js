@@ -40,6 +40,7 @@ app.use((req, res, next) => {
         'https://magicteams.ai',        // Production domain
         'https://www.magicteams.ai',    // Production domain with www
         'https://mission-control-frontend-kappa.vercel.app',
+        'https://magicteams-missioncontrol.netlify.app',
         'https://mission-control-control-plane.vercel.app/',
         process.env.ALLOWED_ORIGIN      // Additional origin from env
     ].filter(Boolean); // Remove undefined values
