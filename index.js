@@ -1,11 +1,14 @@
 import 'dotenv/config';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
+import { verifyToken } from '@clerk/backend';
 import webhookRoutes from './routes/webhooks.js';
 import { provisionUser } from './lib/provisioner.js';
 
 const app = express();
 const PORT = process.env.CONTROL_PLANE_PORT || 4445;
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
+const CLERK_JWT_KEY = process.env.CLERK_JWT_KEY;
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -88,9 +91,209 @@ function requireInternal(req, res, next) {
     next();
 }
 
+function getBearerToken(req) {
+    const header = req.headers?.authorization || req.headers?.Authorization;
+    if (!header || typeof header !== 'string') return null;
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match ? match[1].trim() : null;
+}
+
+function normalizeGatewayBaseUrl(value) {
+    if (!value || typeof value !== 'string') return null;
+    try {
+        return new URL(value).origin;
+    } catch {
+        return null;
+    }
+}
+
+async function requireClerkUser(req, res) {
+    const token = getBearerToken(req);
+    if (!token) {
+        res.status(401).json({ error: 'Missing Authorization: Bearer <token>' });
+        return null;
+    }
+
+    if (!CLERK_JWT_KEY && !CLERK_SECRET_KEY) {
+        res.status(500).json({ error: 'Set CLERK_JWT_KEY or CLERK_SECRET_KEY to verify tokens' });
+        return null;
+    }
+
+    try {
+        const verified = await verifyToken(token, {
+            ...(CLERK_JWT_KEY ? { jwtKey: CLERK_JWT_KEY } : {}),
+            ...(CLERK_SECRET_KEY ? { secretKey: CLERK_SECRET_KEY } : {}),
+        });
+        const userId = verified?.sub;
+        if (!userId) {
+            res.status(401).json({ error: 'Invalid token (missing sub claim)' });
+            return null;
+        }
+        req._clerkAuth = { userId, claims: verified };
+        return userId;
+    } catch (err) {
+        console.warn(`[control-plane] AUTH 401 ${req.method} ${req.path} — ${err.message}`);
+        res.status(401).json({ error: 'Invalid token' });
+        return null;
+    }
+}
+
+async function resolveUserRuntimeContext(req, res, { requireProvisioned = false } = {}) {
+    const userId = await requireClerkUser(req, res);
+    if (!userId) return null;
+
+    const { data, error } = await supabase
+        .from('user_profiles')
+        .select(`
+            userid,
+            username,
+            operation_status,
+            vps_node_id,
+            docker_container_name,
+            gateway_name,
+            gateway_token,
+            local_websocket,
+            instance_url,
+            terminal_url,
+            provisioned_at,
+            provisioning_started_at,
+            provisioning_completed_at,
+            provisioning_error,
+            provisioning_lock_id,
+            last_health_check,
+            updated_at
+        `)
+        .eq('userid', userId)
+        .maybeSingle();
+
+    if (error) {
+        res.status(500).json({ error: error.message });
+        return null;
+    }
+
+    if (!data) {
+        res.status(404).json({ error: 'User profile not found' });
+        return null;
+    }
+
+    const baseUrl = normalizeGatewayBaseUrl(data.instance_url);
+    if (requireProvisioned && !baseUrl) {
+        res.status(409).json({
+            error: 'User instance is not provisioned yet',
+            operationStatus: data.operation_status || null,
+        });
+        return null;
+    }
+
+    return {
+        userId,
+        profile: data,
+        baseUrl,
+        gatewayToken: data.gateway_token || null,
+    };
+}
+
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 app.use('/api/webhooks', webhookRoutes);
+
+app.get('/api/runtime/status', async (req, res) => {
+    const runtime = await resolveUserRuntimeContext(req, res, { requireProvisioned: false });
+    if (!runtime) return;
+
+    const { profile, baseUrl } = runtime;
+    return res.json({
+        ok: true,
+        runtime: {
+            userId: profile.userid,
+            username: profile.username || null,
+            operationStatus: profile.operation_status || null,
+            provisioned: Boolean(baseUrl),
+            provisioningLockId: profile.provisioning_lock_id || null,
+            provisioningStartedAt: profile.provisioning_started_at || null,
+            provisioningCompletedAt: profile.provisioning_completed_at || null,
+            provisioningError: profile.provisioning_error || null,
+            instanceUrl: profile.instance_url || null,
+            terminalUrl: profile.terminal_url || null,
+            websocketUrl: profile.local_websocket || null,
+            gatewayName: profile.gateway_name || null,
+            vpsNodeId: profile.vps_node_id || null,
+            dockerContainerName: profile.docker_container_name || null,
+            provisionedAt: profile.provisioned_at || null,
+            lastHealthCheck: profile.last_health_check || null,
+            updatedAt: profile.updated_at || null,
+        },
+    });
+});
+
+app.get('/api/runtime/health', async (req, res) => {
+    const runtime = await resolveUserRuntimeContext(req, res, { requireProvisioned: false });
+    if (!runtime) return;
+
+    const { profile, baseUrl, gatewayToken } = runtime;
+    if (!baseUrl) {
+        return res.status(200).json({
+            ok: true,
+            status: 'provisioning',
+            operationStatus: profile.operation_status || null,
+            message: 'User instance is not ready yet',
+        });
+    }
+
+    try {
+        try {
+            const rootRes = await fetch(`${baseUrl}/`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(2000),
+            });
+            if (rootRes.ok) {
+                return res.json({ ok: true, status: 'online', ts: new Date().toISOString() });
+            }
+        } catch {
+            // Fall through to gateway token probe.
+        }
+
+        if (!gatewayToken) {
+            return res.status(200).json({
+                ok: true,
+                status: 'offline',
+                message: 'Missing user gateway token',
+            });
+        }
+
+        const gatewayRes = await fetch(`${baseUrl}/v1/chat/completions`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${gatewayToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: 'health-check',
+                messages: [{ role: 'user', content: 'ping' }],
+                max_tokens: 1,
+            }),
+            signal: AbortSignal.timeout(10000),
+        });
+
+        if (!gatewayRes.ok) {
+            const text = await gatewayRes.text().catch(() => '');
+            return res.status(200).json({
+                ok: true,
+                status: 'offline',
+                message: `Gateway error ${gatewayRes.status}`,
+                details: text.slice(0, 200),
+            });
+        }
+
+        return res.json({ ok: true, status: 'online', ts: new Date().toISOString() });
+    } catch (err) {
+        return res.status(200).json({
+            ok: true,
+            status: 'offline',
+            message: err?.message || 'Health probe failed',
+        });
+    }
+});
 
 app.post('/api/provision/user', requireInternal, async (req, res) => {
     const { userId, username, onboardingData } = req.body;
